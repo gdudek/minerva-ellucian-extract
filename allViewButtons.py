@@ -1,4 +1,4 @@
-"""
+r"""
 scrapes all the data from the Minerva (Ellucian) “View all requests page”, opens each request in turn, and saves the data.  It is attached here.  If you are interested, read on. 
  
 As you all know, the current expense report system is being discontinued.  As far as I know, all data there will be discarded including unresolved expense reports which presumably would have to be manually transferred to the new system when it becomes available someday after Feb 1.  This process seems suboptimal, but I accept it.  I discovered I had at least two expense reports which had never been fulfilled without explanation (and in one case the ER had “timed out’ and was coded “automatically suppressed”. 
@@ -34,17 +34,19 @@ Gregory Dudek
 """
 
 import base64
+import os
 import re
 import sys
 import time
 import threading
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
 from bs4 import BeautifulSoup
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -53,6 +55,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 OUTPUT_DIR = Path("pdf_output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 DB_PATH = OUTPUT_DIR / "details.db"
+
+# To reduce random "Unknown option" errors after many back() calls, we optionally
+# reload the list page every N processed rows. Override with env MINERVA_RELOAD_EVERY.
+RELOAD_EVERY = int(os.environ.get("MINERVA_RELOAD_EVERY", "2000"))
 
 
 def setup_driver():
@@ -421,15 +427,182 @@ def extract_row_fields(btn):
         return "", "", "", ""
 
 
-def ensure_list_page(driver, wait) -> bool:
+def is_unknown_option_page(html: str) -> bool:
+    """Detect the 'Unknown option: abc' error page seen after many back() calls."""
+    # Be strict: the stop icon appears on other pages; rely on explicit text
+    return (
+        ("Unknown option" in html and "abc" in html)
+        or 'errortext">*** Unknown option' in html
+    )
+
+
+def is_search_results_page(html: str) -> bool:
+    """Detect the intermediate 'Search Results' page shown after a query."""
+    print("[DEBUG] See Search Results page")
+    return "search results" in html.lower()
+
+
+def is_no_exact_matches_page(html: str) -> bool:
+    """Detect the 'Your search results returned no exact matches' page."""
+    return "your search results returned no exact matches" in html.lower()
+
+
+def click_submit_if_present(driver, wait) -> bool:
+    """If a submit-style button is present, click it and wait briefly; return True if clicked."""
+    try:
+        submit_btn = driver.find_element(
+            By.XPATH,
+            "//input[(translate(@type,'SUBMIT','submit')='submit' or "
+            "contains(translate(@value,'submit','SUBMIT'),'SUBMIT'))]"
+        )
+    except NoSuchElementException:
+        return False
+
+    submit_btn.click()
+    try:
+        wait.until(lambda d: "View All Requests" in d.page_source or bool(get_view_buttons(d)))
+    except TimeoutException:
+        pass
+    return True
+
+
+def reload_like_user(driver, wait):
+    """Reload the current page the way a user would (toolbar reload), not via driver.get()."""
+    try:
+        driver.execute_script("window.location.reload()");
+    except Exception:
+        driver.refresh()
+    try:
+        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+    except TimeoutException:
+        pass
+
+
+def wait_for_navigation(driver, old_url: str, clicked_element=None, timeout: float = 8.0, poll: float = 0.2) -> bool:
+    """
+    Wait for either a URL change or the clicked element to go stale.
+    Returns True if navigation/staleness detected, False on timeout.
+    Uses a shorter timeout/poll than the main wait to avoid long stalls when the site is slow.
+    Safely ignores "Node does not belong to the document" inspector errors that can occur after many clicks.
+    """
+    nav_wait = WebDriverWait(driver, timeout, poll_frequency=poll, ignored_exceptions=(WebDriverException,))
+    stale_check = EC.staleness_of(clicked_element) if clicked_element else None
+
+    def condition(d):
+        if d.current_url != old_url:
+            return True
+        if stale_check:
+            try:
+                return stale_check(d)
+            except WebDriverException:
+                # Element already gone from DOM; treat as staleness achieved
+                return True
+        return False
+
+    try:
+        nav_wait.until(condition)
+        return True
+    except TimeoutException:
+        print("[WARN] Navigation not detected after click; continuing.")
+        return False
+
+
+def ensure_list_page(driver, wait, list_url: Optional[str] = None) -> bool:
     """
     Make sure we're on the 'View All Requests' list page, not a detail view.
     Returns True if found, False otherwise.
+
+    Note: we avoid GET-loading the saved list_url because that can drop POSTed form state.
+    list_url is kept only for logging/backward compatibility.
     """
-    for attempt in range(3):
+    def is_list():
         html = driver.page_source
         if "View All Requests" in html and "Select Document or Request" in html:
+            return True
+        # Fallback: presence of any View buttons is a strong signal we're back
+        return bool(get_view_buttons(driver))
+
+    # First, check current page without navigation
+    if is_list():
+        return True
+
+    for attempt in range(5):
+        html = driver.page_source
+        # If we went too far back (main finance menu), step forward again.
+        if "Advances and Expense Reports Menu" in html:
+            print(f"[WARN] Landed on finance menu while recovering (attempt {attempt + 1}/5); going forward once.")
+            driver.forward()
+            try:
+                wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            except TimeoutException:
+                pass
+            html = driver.page_source
+
+        # New: handle intermediate Search Results page. If it shows 'no exact matches',
+        # skip the hidden submit and just go back; otherwise back then submit.
+        if is_search_results_page(html):
+            no_exact = is_no_exact_matches_page(html)
+            action = "back only (no exact matches)" if no_exact else "back then submit"
+            print(f"[WARN] Detected 'Search Results' page (attempt {attempt + 1}/5); action: {action}.")
+            driver.back()
+            time.sleep(2)
+            try:
+                wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            except TimeoutException:
+                pass
+            html = driver.page_source
+
+            if no_exact:
+                # do NOT click submit; just continue recovery/back logic
+                if "View All Requests" in html and "Select Document or Request" in html:
+                    return True
+                if get_view_buttons(driver):
+                    return True
+            else:
+                # After returning, hit the Submit button if present to regain the list page
+                if click_submit_if_present(driver, wait):
+                    html = driver.page_source
+                    if is_list():
+                        return True
+        if "View All Requests" in html and "Select Document or Request" in html:
             return True  # this is the list
+        if get_view_buttons(driver):
+            return True
+
+        # Special case: after many back() calls the server sometimes shows
+        # "*** Unknown option: abc". Try one more back() and, if needed,
+        # click the page's Submit button to return to the list.
+        if is_unknown_option_page(html):
+            print(f"[WARN] Detected 'Unknown option' page (attempt {attempt + 1}/5); trying recovery.")
+            # First back
+            driver.back()
+            time.sleep(2)
+            try:
+                wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            except TimeoutException:
+                print("[DEBUG] TimeoutException")
+                pass
+
+            # After first back, if we see a submit button, click it; otherwise if still on the
+            # unknown page, back once more, then click submit if present.
+            print("[DEBUG] Looking for submit button")
+            if click_submit_if_present(driver, wait):
+                print("[DEBUG] Clicked submit")
+                return True
+
+            if is_unknown_option_page(driver.page_source):
+                print(f"[WARN] Detected 'Unknown option' page AGAIN! (attempt {attempt + 1}/5); trying recovery.")
+                driver.back()
+                time.sleep(1)
+                try:
+                    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                except TimeoutException:
+                    print("[DEBUG] TimeoutException")
+                    pass
+                if click_submit_if_present(driver, wait):
+                    return True
+
+            # If neither back nor submit got us out, continue loop to retry/back again
 
         # If we're on a 'View' / detail page, try going back
         driver.back()
@@ -438,7 +611,13 @@ def ensure_list_page(driver, wait) -> bool:
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
         except TimeoutException:
+            print("[DEBUG] Clicked submit")
             pass
+
+    # As a final fallback, mimic the user's reload; avoid driver.get(list_url) to preserve form state
+    reload_like_user(driver, wait)
+    if is_list():
+        return True
 
     return False
 
@@ -477,6 +656,9 @@ def main():
                   "after a few back() attempts.")
             print(driver.page_source[:1000])
             return
+
+        # Remember the URL of the list page so we can reload it if "back" fails later.
+        list_url = driver.current_url
 
         # Now we *know* we're on the list page with the buttons
         try:
@@ -564,11 +746,8 @@ def main():
             print(f"[DEBUG] Clicking View for row {idx + 1}…")
             btn.click()
 
-            # Wait for navigation
-            try:
-                wait.until(lambda d: d.current_url != old_url)
-            except TimeoutException:
-                pass
+            # Wait for navigation or element staleness with a shorter timeout to avoid stalls
+            wait_for_navigation(driver, old_url, btn, timeout=8, poll=0.2)
 
             try:
                 wait.until(
@@ -645,10 +824,21 @@ def main():
             print(f"[DEBUG] Going back to list after row {idx + 1}")
             driver.back()
 
-            if not ensure_list_page(driver, wait):
+            if not ensure_list_page(driver, wait, list_url):
                 print("[ERROR] After back(), could not return to list page; stopping.")
                 print(driver.page_source[:1000])
                 break
+
+            # Periodically reload the list page to avoid server/session weirdness
+            # seen after many back() navigations (e.g., "Unknown option" errors).
+            if RELOAD_EVERY > 0 and (idx + 1) % RELOAD_EVERY == 0 and (idx + 1) < num:
+                print(f"[INFO] Reloading list page after {idx + 1} rows (RELOAD_EVERY={RELOAD_EVERY}) via toolbar reload.")
+                reload_like_user(driver, wait)
+                if not ensure_list_page(driver, wait, list_url):
+                    # ensure_list_page already attempted recovery (back/submit/reload)
+                    print("[ERROR] Reload failed; could not restore list page after refresh.")
+                    print(driver.page_source[:1000])
+                    break
 
         print("[INFO] Finished processing all View buttons.")
 

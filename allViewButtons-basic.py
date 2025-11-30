@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -43,6 +43,34 @@ def print_current_page_to_pdf(driver: webdriver.Chrome, output_path: Path):
     )
     pdf_bytes = base64.b64decode(pdf["data"])
     output_path.write_bytes(pdf_bytes)
+
+
+def wait_for_navigation(driver, old_url: str, clicked_element=None, timeout: float = 8.0, poll: float = 0.2) -> bool:
+    """
+    Wait for either a URL change or the clicked element to go stale.
+    Returns True if navigation/staleness detected, False on timeout.
+    Uses a shorter timeout to avoid long stalls when the site is slow.
+    Safely ignores "Node does not belong to the document" inspector errors after many clicks.
+    """
+    nav_wait = WebDriverWait(driver, timeout, poll_frequency=poll, ignored_exceptions=(WebDriverException,))
+    stale_check = EC.staleness_of(clicked_element) if clicked_element else None
+
+    def condition(d):
+        if d.current_url != old_url:
+            return True
+        if stale_check:
+            try:
+                return stale_check(d)
+            except WebDriverException:
+                return True
+        return False
+
+    try:
+        nav_wait.until(condition)
+        return True
+    except TimeoutException:
+        print("[WARN] Navigation not detected after click; continuing.")
+        return False
 
 
 def sanitize_filename(text: str) -> str:
@@ -121,10 +149,48 @@ def ensure_list_page(driver, wait) -> bool:
     Make sure we're on the 'View All Requests' list page, not a detail view.
     Returns True if found, False otherwise.
     """
+    def click_submit_if_present():
+        """If a submit-style button is present, click it and wait briefly; return True if clicked."""
+        try:
+            submit_btn = driver.find_element(
+                By.XPATH,
+                "//input[(translate(@type,'SUBMIT','submit')='submit' or "
+                "contains(translate(@value,'submit','SUBMIT'),'SUBMIT'))]"
+            )
+        except NoSuchElementException:
+            return False
+
+        submit_btn.click()
+        try:
+            wait.until(lambda d: "View All Requests" in d.page_source or bool(get_view_buttons(d)))
+        except TimeoutException:
+            pass
+        return True
+
     for attempt in range(3):
         html = driver.page_source
         if "View All Requests" in html and "Select Document or Request" in html:
             return True  # this is the list
+
+        # If we land on an intermediate Search Results page, step back once.
+        # If the page says "no exact matches", do NOT click submit (it may be hidden); just back out.
+        if "search results" in html.lower():
+            no_exact = "your search results returned no exact matches" in html.lower()
+            action = "back only (no exact matches)" if no_exact else "back then submit"
+            print(f"[WARN] Detected 'Search Results' page (attempt {attempt + 1}/3); action: {action}.")
+            driver.back()
+            try:
+                wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            except TimeoutException:
+                pass
+            html = driver.page_source
+            if not no_exact:
+                click_submit_if_present()
+                html = driver.page_source
+            if "View All Requests" in html and "Select Document or Request" in html:
+                return True
+            if get_view_buttons(driver):
+                return True
 
         # If we're on a 'View' / detail page, try going back
         driver.back()
@@ -251,11 +317,8 @@ def main():
             print(f"[DEBUG] Clicking View for row {idx + 1}…")
             btn.click()
 
-            # Wait for navigation
-            try:
-                wait.until(lambda d: d.current_url != old_url)
-            except TimeoutException:
-                pass
+            # Wait for navigation or element staleness with a shorter timeout to avoid stalls
+            wait_for_navigation(driver, old_url, btn, timeout=8, poll=0.2)
 
             try:
                 wait.until(
