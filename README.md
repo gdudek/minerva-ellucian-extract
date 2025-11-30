@@ -22,5 +22,7 @@ To automate Chrome, you first need to launch it to enable remote control. On Mac
         SELECT * FROM summary_items WHERE request_id = ? ORDER BY row_order;
       - Totals/Grand Total/Due to Claimant are marked with row_type='total'; line items have row_type='item'.
 
-      
-Tested only on Ellucian 1.10 (Nov 2025)
+Tested only on Minerva with Ellucian 1.10 (Nov 2025)
+
+Git repo:  https://github.com/gdudek/minerva-ellucian-extract
+
