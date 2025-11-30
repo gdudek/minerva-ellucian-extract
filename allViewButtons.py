@@ -439,6 +439,7 @@ def is_unknown_option_page(html: str) -> bool:
 def is_search_results_page(html: str) -> bool:
     """Detect the intermediate 'Search Results' page shown after a query."""
     print("[DEBUG] See Search Results page")
+    time.sleep(1)
     return "search results" in html.lower()
 
 
@@ -540,7 +541,7 @@ def ensure_list_page(driver, wait, list_url: Optional[str] = None) -> bool:
 
         # New: handle intermediate Search Results page. If it shows 'no exact matches',
         # skip the hidden submit and just go back; otherwise back then submit.
-        if is_search_results_page(html):
+        if is_search_results_page(html) and is_search_results_page(html) :
             no_exact = is_no_exact_matches_page(html)
             action = "back only (no exact matches)" if no_exact else "back then submit"
             print(f"[WARN] Detected 'Search Results' page (attempt {attempt + 1}/5); action: {action}.")
