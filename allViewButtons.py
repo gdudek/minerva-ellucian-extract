@@ -28,18 +28,23 @@ To automate Chrome, you first need to launch it to enable remote control. On Mac
       - Get all items for that report:
         SELECT * FROM summary_items WHERE request_id = ? ORDER BY row_order;
       - Totals/Grand Total/Due to Claimant are marked with row_type='total'; line items have row_type='item'.
+      - A convenience view lives in request_overview (one row per request):
+        SELECT r.id, r.reference_num, o.ref_code, o.paid_to, o.destination_city, o.grand_total, o.request_status, o.payment_info_text
+          FROM requests r JOIN request_overview o ON o.request_id = r.id;
 
 
 Gregory Dudek
 """
 
 import base64
+import json
 import os
 import re
 import sys
 import time
 import threading
 import sqlite3
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +60,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 OUTPUT_DIR = Path("pdf_output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 DB_PATH = OUTPUT_DIR / "details.db"
+DEBUGGER_ADDRESS = os.environ.get("MINERVA_DEBUG_ADDR", "127.0.0.1:9222")
 
 # To reduce random "Unknown option" errors after many back() calls, we optionally
 # reload the list page every N processed rows. Override with env MINERVA_RELOAD_EVERY.
@@ -70,11 +76,48 @@ def setup_driver():
     #     --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-minerva-profile
     #
 
-    options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+    options.add_experimental_option("debuggerAddress", DEBUGGER_ADDRESS)
 
     driver = webdriver.Chrome(options=options)
     driver.implicitly_wait(5)
+    try:
+        # Silence noisy third-party analytics failures (e.g., Plausible) that occasionally
+        # appear in Chrome logs when the network blocks them.
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd(
+            "Network.setBlockedURLs",
+            {"urls": ["*://plausible.io/*", "*://*.plausible.io/*"]},
+        )
+    except Exception:
+        # Non-fatal: continue even if CDP isn’t available
+        pass
     return driver
+
+
+def ensure_debug_chrome() -> bool:
+    """
+    Fast pre-flight check for a Chrome instance started with --remote-debugging-port.
+    Avoids long Selenium timeouts when Chrome isn't running.
+    """
+    try:
+        host, port = DEBUGGER_ADDRESS.split(":")
+    except ValueError:
+        host, port = DEBUGGER_ADDRESS, "9222"
+
+    url = f"http://{host}:{port}/json/version"
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}")
+            json.loads(resp.read() or b"{}")
+        return True
+    except Exception as exc:
+        print("[ERROR] Could not reach Chrome devtools at", DEBUGGER_ADDRESS)
+        print("       Start Chrome first, e.g.:")
+        print("       /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\")
+        print("         --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-minerva-profile")
+        print(f"       ({exc})")
+        return False
 
 def print_current_page_to_pdf(driver: webdriver.Chrome, output_path: Path):
     """Use Chrome DevTools Page.printToPDF to dump the current page to a PDF file."""
@@ -229,6 +272,146 @@ def extract_summary_items(table_tag, label: str):
     return items
 
 
+def extract_overview_data(soup: BeautifulSoup, summary_items: list[dict]) -> dict:
+    """
+    Pull a handful of high-level fields from the detail page so they can live
+    together in one easy-to-query table.
+    """
+    overview = {
+        "paid_to": "",
+        "destination_city": "",
+        "grand_total": "",
+        "request_status": "",
+        "payment_info_text": "",
+        "ref_code": "",
+    }
+
+    tables = find_tables_after_heading(soup, "Request for Expense Reimbursement")
+
+    def headers_and_rows(tbl):
+        hdrs, rows = parse_table_rows(tbl)
+        hdrs_norm = [normalize_header(h) for h in hdrs]
+        return hdrs_norm, rows
+
+    # Paid to (a table whose text mentions "Paid to" and has a Name column)
+    for tbl in tables:
+        tbl_text = tbl.get_text(" ", strip=True).lower()
+        if "paid to" not in tbl_text:
+            continue
+        hdrs, rows = headers_and_rows(tbl)
+        name_idx = None
+        for i, h in enumerate(hdrs):
+            if h == "name" or h.endswith("name"):
+                name_idx = i
+                break
+        if name_idx is None:
+            continue
+        for row in rows:
+            if not any(cell.strip() for cell in row):
+                continue
+            # Skip rows that look like headers
+            header_like = True
+            for i, cell in enumerate(row):
+                if i >= len(hdrs):
+                    header_like = False
+                    break
+                if normalize_header(cell) != hdrs[i]:
+                    header_like = False
+                    break
+            if header_like:
+                continue
+            if name_idx < len(row) and row[name_idx].strip():
+                overview["paid_to"] = row[name_idx].strip()
+                break
+        if overview["paid_to"]:
+            break
+
+    # Payment Information table → destination city + descriptive text
+    for tbl in tables:
+        label = table_label(tbl).lower()
+        tbl_text = tbl.get_text(" ", strip=True).lower()
+        if "payment information" not in label and "payment information" not in tbl_text:
+            continue
+        hdrs, rows = headers_and_rows(tbl)
+        data_rows = [r for r in rows if any(c.strip() for c in r)]
+
+        dest_idx = None
+        for i, h in enumerate(hdrs):
+            if "destination city" in h:
+                dest_idx = i
+                break
+        if dest_idx is not None:
+            for r in data_rows:
+                if dest_idx < len(r) and r[dest_idx].strip():
+                    overview["destination_city"] = r[dest_idx].strip()
+                    break
+
+        desc_candidates = []
+        for r in data_rows:
+            non_empty = [c.strip() for c in r if c.strip()]
+            if len(non_empty) == 1:
+                desc_candidates.append(non_empty[0])
+        if desc_candidates:
+            overview["payment_info_text"] = max(desc_candidates, key=len)
+        break
+
+    # Approval Information table → request status
+    for tbl in tables:
+        label = table_label(tbl).lower()
+        tbl_text = tbl.get_text(" ", strip=True).lower()
+        if "approval information" not in label and "approval information" not in tbl_text:
+            continue
+        hdrs, rows = headers_and_rows(tbl)
+        status_idx = None
+        for i, h in enumerate(hdrs):
+            if "request status" in h:
+                status_idx = i
+                break
+        if status_idx is not None:
+            for r in rows:
+                if not any(c.strip() for c in r):
+                    continue
+                if status_idx < len(r) and r[status_idx].strip():
+                    overview["request_status"] = r[status_idx].strip()
+                    break
+        if not overview["request_status"]:
+            # Fallback: first non-empty cell in the table
+            for r in rows:
+                non_empty = [c.strip() for c in r if c.strip()]
+                if non_empty:
+                    overview["request_status"] = non_empty[0]
+                    break
+        break
+
+    # Grand Total (prefer Summary of Expenses totals we already parsed)
+    for item in summary_items:
+        item_label = normalize_header(item.get("item_no", "") or item.get("description", ""))
+        if "grand total" in item_label:
+            overview["grand_total"] = (
+                item.get("trans_amount")
+                or item.get("cad_amount")
+                or item.get("allowable_expense")
+                or ""
+            )
+            break
+    if not overview["grand_total"]:
+        for tbl in tables:
+            label = table_label(tbl).lower()
+            tbl_text = tbl.get_text(" ", strip=True).lower()
+            if "summary of expenses" not in label and "summary of expenses" not in tbl_text:
+                continue
+            _, rows = headers_and_rows(tbl)
+            for r in rows:
+                cells_norm = [normalize_header(c) for c in r if c.strip()]
+                if cells_norm and cells_norm[0].startswith("grand total"):
+                    if len(r) > 1 and r[1].strip():
+                        overview["grand_total"] = r[1].strip()
+                    break
+            break
+
+    return overview
+
+
 def table_label(table_tag) -> str:
     """Infer a human-friendly label for a table using nearby text."""
     # Caption takes priority
@@ -289,6 +472,28 @@ def init_db():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS request_overview (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER UNIQUE,
+            paid_to TEXT,
+            destination_city TEXT,
+            grand_total TEXT,
+            request_status TEXT,
+            payment_info_text TEXT,
+            ref_code TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(request_id) REFERENCES requests(id)
+        )
+        """
+    )
+    # Backfill schema if an older DB already exists (SQLite lacks IF NOT EXISTS on columns pre-3.35)
+    for col in ["ref_code"]:
+        try:
+            cur.execute(f"ALTER TABLE request_overview ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS sections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id INTEGER,
@@ -324,7 +529,7 @@ def init_db():
 
 
 def save_detail_text(driver, path: Path):
-    """Save a readable text version of the current detail page and return structured sections and items."""
+    """Save a readable text version of the current detail page and return structured sections, items, and overview."""
     soup = BeautifulSoup(driver.page_source, "html.parser")
 
     tables = find_tables_after_heading(soup, "Request for Expense Reimbursement")
@@ -336,6 +541,7 @@ def save_detail_text(driver, path: Path):
         "summary of expenses item",
         "foapal distribution",
         "approval information",
+        "paid to responsible",
     ]
 
     def table_matches(tbl):
@@ -373,7 +579,8 @@ def save_detail_text(driver, path: Path):
         sections.append(("(no tables found)", ""))
 
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    return sections, summary_items
+    overview = extract_overview_data(soup, summary_items)
+    return sections, summary_items, overview
 
 
 def start_blinking_prompt(prompt: str = "> ", interval: float = 0.5):
@@ -425,6 +632,22 @@ def extract_row_fields(btn):
 
     except NoSuchElementException:
         return "", "", "", ""
+
+
+def extract_queue_code(queue_title: str) -> str:
+    """
+    Return the leading two-letter code from the queue title
+    (e.g., 'AR - APPROVED ...' → 'AR'). Falls back to the first 2 uppercase letters.
+    """
+    if not queue_title:
+        return ""
+    # Common pattern: "AR - APPROVED - Extract Data to Banner"
+    m = re.match(r"\s*([A-Za-z]{2})\b", queue_title)
+    if m:
+        return m.group(1).upper()
+    # Fallback: first two consecutive uppercase letters anywhere
+    m = re.search(r"([A-Z]{2})", queue_title)
+    return m.group(1).upper() if m else ""
 
 
 def is_unknown_option_page(html: str) -> bool:
@@ -632,6 +855,9 @@ def get_view_buttons(driver):
 
 
 def main():
+    if not ensure_debug_chrome():
+        return
+
     driver = setup_driver()
     wait = WebDriverWait(driver, 15)
     init_db()
@@ -762,7 +988,9 @@ def main():
 
             txt_path = out_path.with_suffix(".txt")
             print(f"[INFO] Saving text for row {idx + 1} → {txt_path}")
-            sections, summary_items = save_detail_text(driver, txt_path)
+            sections, summary_items, overview = save_detail_text(driver, txt_path)
+            if not overview.get("ref_code"):
+                overview["ref_code"] = extract_queue_code(queue_title)
 
             # Persist to SQLite
             conn = sqlite3.connect(DB_PATH)
@@ -784,6 +1012,23 @@ def main():
                 ),
             )
             req_id = cur.lastrowid
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO request_overview (
+                    request_id, paid_to, destination_city, grand_total, request_status, payment_info_text, ref_code
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    req_id,
+                    overview.get("paid_to", ""),
+                    overview.get("destination_city", ""),
+                    overview.get("grand_total", ""),
+                    overview.get("request_status", ""),
+                    overview.get("payment_info_text", ""),
+                    overview.get("ref_code", ""),
+                ),
+            )
             for name, content in sections:
                 cur.execute(
                     """
