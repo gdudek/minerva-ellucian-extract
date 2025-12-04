@@ -19,9 +19,11 @@ To automate Chrome, you first need to launch it to enable remote control. On Mac
 
 # Database browsing
   How to use the SQL database:
-      - Each processed report has a requests.id. Find it (e.g., SELECT id, reference_num, start_date FROM requests;).
+      - Each processed report has a request.id. Find it (e.g., SELECT id, reference_num, start_date FROM requests;).
+      
       - Get all items for that report:
         SELECT * FROM summary_items WHERE request_id = ? ORDER BY row_order;
+        
       - Totals/Grand Total/Due to Claimant are marked with row_type='total'; line items have row_type='item'.
 
 Tested only on Minerva with Ellucian 1.10 (Nov 2025)
