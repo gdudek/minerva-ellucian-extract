@@ -5,7 +5,9 @@ This program scrapes all the data from the Minerva (Ellucian) “View all reques
 
 # Usage
 Run Chome with debugging port on (see below)
+
 Install packages from requirements.txt
+
 python3  allViewButtons-basic.py 
 
 # Run Chome with debugging port
