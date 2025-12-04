@@ -8,7 +8,7 @@ Run Chome with debugging port on (see below)
 
 Install packages from requirements.txt
 
-python3  allViewButtons-basic.py 
+python3  allViewButtons.py 
 
 # Run Chome with debugging port
 To automate Chrome, you first need to launch it to enable remote control. On MacOS it’s as follows, and similar on other platforms.
